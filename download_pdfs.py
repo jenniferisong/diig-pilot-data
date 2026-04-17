@@ -153,8 +153,39 @@ def try_fill_search_box(page, uid: str):
     for selector in possible_search_boxes:
         locator = page.locator(selector).first
         if locator.count() > 0:
+            try:
+                locator.click()
+                locator.press("Control+A")
+                locator.press("Backspace")
+            except Exception:
+                pass
             locator.fill(uid)
             return True
+
+    return False
+
+
+def has_search_box(page) -> bool:
+    """
+    Check whether the current page looks like the search page.
+    """
+    possible_search_boxes = [
+        "input[type='search']",
+        "input[name='q']",
+        "input[name='query']",
+        "input[name='search']",
+        "input[id*='search']",
+        "input[placeholder*='Search']",
+        "input[placeholder*='search']",
+        "input[type='text']",
+    ]
+
+    for selector in possible_search_boxes:
+        try:
+            if page.locator(selector).first.count() > 0:
+                return True
+        except Exception:
+            pass
 
     return False
 
@@ -183,52 +214,146 @@ def try_click_search_button(page):
     return False
 
 
-def try_open_first_result(page) -> bool:
+def go_to_search_page(page):
     """
-    Open the first search result.
+    Make sure we are back on the main search page before starting a UID.
     """
-    result_links = [
-        ("first result title link", page.locator("a.resultTitle").first),
-        ("first docview link", page.locator("a[href*='docview']").first),
-        ("first record link", page.locator("a[href*='record']").first),
-        ("first main result link", page.locator("main a").first),
-        ("first visible link with title", page.get_by_role("link").first),
+    try:
+        page.goto(START_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+
+
+def try_get_permalink(page, uid: str) -> str:
+    """
+    Click the Permalink option on the results page and read the URL.
+
+    Many sites place the link into a focused text box after clicking Permalink.
+    This function checks that focused box first, then other obvious input fields.
+    """
+    permalink_buttons = [
+        ("button: Permalink", page.get_by_role("button", name=re.compile(r"permalink", re.I)).first),
+        ("link: Permalink", page.get_by_role("link", name=re.compile(r"permalink", re.I)).first),
+        ("text: Permalink", page.locator(":text('Permalink')").first),
     ]
 
-    for label, locator in result_links:
+    for label, locator in permalink_buttons:
         try:
             if locator.count() == 0:
                 continue
 
-            print(f"  Opening first result using: {label}")
+            print(f"  Clicking permalink using: {label}")
             locator.click()
-            page.wait_for_timeout(3000)
-            return True
+            page.wait_for_timeout(1500)
+
+            active_value = page.evaluate(
+                """
+                () => {
+                    const el = document.activeElement;
+                    if (!el) return "";
+                    if (typeof el.value === "string") return el.value.trim();
+                    return "";
+                }
+                """
+            )
+            if isinstance(active_value, str) and active_value.startswith("http"):
+                return active_value
+
+            input_selectors = [
+                "input[type='url']",
+                "input[value^='http']",
+                "textarea",
+                "input",
+            ]
+            for selector in input_selectors:
+                field = page.locator(selector).first
+                if field.count() == 0:
+                    continue
+                try:
+                    value = field.input_value().strip()
+                    if value.startswith("http"):
+                        return value
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    return False
+    return ""
 
 
-def try_open_details_tab(page) -> bool:
+def try_read_visible_permalink(page) -> str:
     """
-    Open the Details tab on the record page.
+    Read a permalink directly from the current page without clicking anything.
+
+    This is useful on a record page where a Permalink section is already visible.
     """
-    details_tabs = [
-        ("button: Details exact", page.get_by_role("button", name=re.compile(r"^details$", re.I)).first),
-        ("button: Details", page.get_by_role("button", name=re.compile(r"details", re.I)).first),
-        ("css button: Details", page.locator("button:has-text('Details')").first),
-        ("tab: Details", page.get_by_role("tab", name=re.compile(r"details", re.I)).first),
-        ("link: Details", page.get_by_role("link", name=re.compile(r"details", re.I)).first),
+    try:
+        permalink_section_selectors = [
+            "label:has-text('Permalink') + input",
+            "label:has-text('Permalink') ~ input",
+            "text=Permalink:",
+        ]
+
+        for selector in permalink_section_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                value = locator.input_value().strip()
+                if value.startswith("http"):
+                    return value
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    input_selectors = [
+        "input[type='url']",
+        "input[value^='http']",
+        "textarea",
+        "input",
     ]
 
-    for label, locator in details_tabs:
+    for selector in input_selectors:
+        try:
+            field = page.locator(selector).first
+            if field.count() == 0:
+                continue
+            value = field.input_value().strip()
+            if value.startswith("http"):
+                return value
+        except Exception:
+            pass
+
+    try:
+        page_text = page.locator("body").inner_text(timeout=5000)
+        url_match = re.search(r"https?://\S+", page_text)
+        if url_match:
+            return url_match.group(0).rstrip(".,);")
+    except Exception:
+        pass
+
+    return ""
+
+
+def try_filter_to_hearing(page) -> bool:
+    """
+    Try to filter the results page to Document Type: HEARING.
+    """
+    hearing_filters = [
+        ("checkbox: HEARING", page.get_by_role("checkbox", name=re.compile(r"hearing", re.I)).first),
+        ("label: HEARING", page.get_by_text(re.compile(r"^hearing$", re.I)).first),
+        ("document type HEARING", page.locator(":has-text('Document Type')").locator(":text('HEARING')").first),
+        ("facet HEARING", page.locator("[class*='facet']:has-text('HEARING')").first),
+    ]
+
+    for label, locator in hearing_filters:
         try:
             if locator.count() == 0:
                 continue
 
-            print(f"  Opening details tab using: {label}")
-            locator.wait_for(timeout=10000)
+            print(f"  Applying HEARING filter using: {label}")
             locator.click()
             page.wait_for_timeout(4000)
             return True
@@ -238,63 +363,12 @@ def try_open_details_tab(page) -> bool:
     return False
 
 
-def try_get_full_pdf_url(page, uid: str) -> str:
-    """
-    Open the full PDF option and return its URL.
-
-    Simple strategy:
-    - Click a "Complete PDF" or similar option
-    - If a new tab opens, use that tab's URL
-    - If the current page changes to a PDF/viewer page, use the current URL
-    """
-    pdf_buttons = [
-        ("button: Complete PDF", page.get_by_role("button", name=re.compile(r"complete\s*pdf", re.I)).first),
-        ("link: Complete PDF", page.get_by_role("link", name=re.compile(r"complete\s*pdf", re.I)).first),
-        ("button: Full text PDF", page.get_by_role("button", name=re.compile(r"full\s*text\s*pdf", re.I)).first),
-        ("link: Full text PDF", page.get_by_role("link", name=re.compile(r"full\s*text\s*pdf", re.I)).first),
-        ("button: Full PDF", page.get_by_role("button", name=re.compile(r"full.*pdf", re.I)).first),
-        ("link: Full PDF", page.get_by_role("link", name=re.compile(r"full.*pdf", re.I)).first),
-        ("button: PDF", page.get_by_role("button", name=re.compile(r"\bpdf\b", re.I)).first),
-        ("link: PDF", page.get_by_role("link", name=re.compile(r"\bpdf\b", re.I)).first),
-    ]
-
-    original_url = page.url
-
-    for label, locator in pdf_buttons:
-        try:
-            if locator.count() == 0:
-                continue
-
-            print(f"  Trying PDF fallback option: {label}")
-
-            try:
-                with page.context.expect_page(timeout=10000) as new_page_info:
-                    locator.click()
-                new_page = new_page_info.value
-                new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                new_page.wait_for_timeout(2000)
-                pdf_url = new_page.url.strip()
-                if pdf_url.startswith("http"):
-                    new_page.close()
-                    return pdf_url
-                new_page.close()
-            except Exception:
-                # No new tab may have opened. In that case, keep checking below.
-                pass
-
-            page.wait_for_timeout(3000)
-            if page.url and page.url != original_url and page.url.startswith("http"):
-                return page.url
-        except Exception:
-            pass
-
-    return ""
-
-
 def process_one_uid(page, uid: str) -> str:
     """
-    Search one UID, open the first result, open the details tab,
-    and capture the full PDF page URL.
+    Search one UID, click Permalink on the results page,
+    and capture that link.
+    If the results page has no Permalink option, filter to Document Type: HEARING
+    and try Permalink again.
     If anything fails, return an empty string.
     """
     print(f"Searching UID: {uid}")
@@ -308,23 +382,42 @@ def process_one_uid(page, uid: str) -> str:
         # If no visible search button is found, pressing Enter is the simplest fallback.
         page.keyboard.press("Enter")
 
-    # Give the results page a moment to load before looking for the PDF option.
+    # Give the results page a moment to load before looking for the Permalink button.
     page.wait_for_timeout(4000)
 
-    if not try_open_first_result(page):
-        print(f"  Could not open the first result for UID {uid}")
-        return ""
+    permalink = try_get_permalink(page, uid)
+    if permalink:
+        print(f"  Saved permalink: {permalink}")
+        return permalink
 
-    if not try_open_details_tab(page):
-        print(f"  Could not open the details tab for UID {uid}")
-        return ""
+    print("  No permalink on results page. Trying Document Type: HEARING filter...")
+    if try_filter_to_hearing(page):
+        permalink = try_get_permalink(page, uid)
+        if permalink:
+            print(f"  Saved permalink after HEARING filter: {permalink}")
+            return permalink
 
-    pdf_url = try_get_full_pdf_url(page, uid)
-    if pdf_url:
-        print(f"  Saved PDF page URL: {pdf_url}")
-        return pdf_url
+    print(f"  Could not find a permalink for UID {uid}")
+    return ""
 
-    print(f"  Could not find a full PDF link for UID {uid}")
+
+def process_one_uid_with_retry(page, uid: str) -> str:
+    """
+    Try each UID up to two times.
+
+    Each attempt starts from the search page again so old results do not
+    interfere with the next search.
+    """
+    for attempt in range(1, 3):
+        print(f"  Attempt {attempt} for UID {uid}")
+        go_to_search_page(page)
+
+        permalink = process_one_uid(page, uid)
+        if permalink:
+            return permalink
+
+        print(f"  Attempt {attempt} did not succeed for UID {uid}")
+
     return ""
 
 
@@ -332,7 +425,7 @@ def main():
     """
     Main script flow.
     """
-    print("Starting PDF link collection script...")
+    print("Starting permalink collection script...")
 
     excel_path = find_excel_file()
     df = load_excel(excel_path)
@@ -341,8 +434,8 @@ def main():
     print(f"UID column found automatically: {uid_column}")
 
     # Create the output column if it does not already exist.
-    if "pdf_link" not in df.columns:
-        df["pdf_link"] = ""
+    if "permalink" not in df.columns:
+        df["permalink"] = ""
 
     with sync_playwright() as p:
         wait_for_manual_login()
@@ -386,37 +479,32 @@ def main():
             # If UID is blank, skip it.
             if not uid:
                 print("  UID is blank. Skipping.")
-                df.at[index, "pdf_link"] = ""
+                df.at[index, "permalink"] = ""
                 continue
 
-            # If pdf_link already has something, keep it and skip.
-            existing_pdf_link = str(row.get("pdf_link", "")).strip()
-            if existing_pdf_link and existing_pdf_link.lower() != "nan":
-                print("  pdf_link already exists. Skipping.")
+            # If permalink already has something, keep it and skip.
+            existing_permalink = str(row.get("permalink", "")).strip()
+            if existing_permalink and existing_permalink.lower() != "nan":
+                print("  permalink already exists. Skipping.")
                 continue
 
             try:
-                pdf_link = process_one_uid(page, uid)
-                df.at[index, "pdf_link"] = pdf_link
+                permalink = process_one_uid_with_retry(page, uid)
+                df.at[index, "permalink"] = permalink
             except PlaywrightTimeoutError:
-                print(f"  Timed out while processing UID {uid}. Leaving pdf_link blank.")
-                df.at[index, "pdf_link"] = ""
+                print(f"  Timed out while processing UID {uid}. Leaving permalink blank.")
+                df.at[index, "permalink"] = ""
             except Exception as exc:
                 print(f"  Error while processing UID {uid}: {exc}")
-                print("  Leaving pdf_link blank and continuing.")
-                df.at[index, "pdf_link"] = ""
+                print("  Leaving permalink blank and continuing.")
+                df.at[index, "permalink"] = ""
 
             # Save after every row so progress is not lost if something stops later.
             df.to_excel(OUTPUT_FILE, index=False)
 
             # Go back to the search page for the next UID.
-            # We may need to go back twice: once from the record page to results,
-            # and once from results to the search page state.
             try:
-                page.go_back(timeout=10000)
-                page.wait_for_timeout(3000)
-                page.go_back(timeout=10000)
-                page.wait_for_timeout(3000)
+                go_to_search_page(page)
             except Exception:
                 print("  Could not go back automatically.")
                 print("  If the next search fails, manually return to the search page and run again.")
