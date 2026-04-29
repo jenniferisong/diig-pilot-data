@@ -1,0 +1,954 @@
+import argparse
+import re
+import time
+from pathlib import Path
+from urllib.parse import urljoin
+
+import pandas as pd
+from openpyxl import load_workbook
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+
+# This is the website you will open manually in your own Edge window before the script starts searching.
+START_URL = "https://congressional-proquest-com.proxy.lib.duke.edu/profiles/gis/search/basic/basicsearch"
+
+# This is the local debugging address that Edge exposes when you start it
+# with --remote-debugging-port=9222.
+EDGE_DEBUG_URL = "http://127.0.0.1:9222"
+
+# Output Excel file name.
+OUTPUT_FILE = "output_with_pdfs.xlsx"
+
+# Folder where downloaded PDFs will be saved.
+PDF_DOWNLOAD_FOLDER = "downloaded_pdfs"
+
+# Output column for the downloaded complete-replica PDF path.
+PDF_LINK_COLUMN = "pdf_link"
+
+# Some complete hearing replicas are large and slow through the Duke proxy.
+PDF_DOWNLOAD_TIMEOUT_MS = 600000
+DOWNLOAD_EVENT_TIMEOUT_MS = 30000
+
+
+def find_excel_file() -> Path:
+    """
+    Find the first Excel file in the current folder.
+    We ignore the output file so we do not accidentally re-read it later.
+    """
+    current_folder = Path(".")
+    excel_files = [
+        path
+        for path in current_folder.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in [".xls", ".xlsx"]
+        and path.name != OUTPUT_FILE
+    ]
+
+    if not excel_files:
+        raise FileNotFoundError("No Excel file (.xls or .xlsx) was found in this folder.")
+
+    if len(excel_files) > 1:
+        print("More than one Excel file was found.")
+        print(f"Using the first one: {excel_files[0].name}")
+
+    return excel_files[0]
+
+
+def parse_args():
+    """
+    Read optional command line row limits.
+    Excel row 1 is the header, so Excel row 2 is the first data row.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--start-excel-row",
+        type=int,
+        default=2,
+        help="First Excel row to process. Row 2 is the first data row.",
+    )
+    parser.add_argument(
+        "--end-excel-row",
+        type=int,
+        default=None,
+        help="Last Excel row to process. Leave blank to process through the end.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of Excel rows to process starting at --start-excel-row. "
+            "For example, --start-excel-row 6 --batch-size 10 processes rows 6-15."
+        ),
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=1,
+        help=(
+            "Save after this many processed rows. Use a larger number for faster batches; "
+            "1 is safest because it saves after every row."
+        ),
+    )
+    return parser.parse_args()
+
+
+def load_excel(excel_path: Path) -> pd.DataFrame:
+    """
+    Read the Excel file into a pandas DataFrame.
+
+    Important:
+    - .xlsx files usually work with openpyxl
+    - .xls files usually need xlrd installed
+    """
+    print(f"Reading Excel file: {excel_path.name}")
+
+    if excel_path.suffix.lower() == ".xls":
+        return pd.read_excel(excel_path, engine="xlrd")
+
+    return pd.read_excel(excel_path)
+
+
+def carry_forward_existing_output(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep permalink/pdf_link values from a previous output workbook.
+    This prevents a row-limited rerun from blanking rows that were already done.
+    """
+    output_path = Path(OUTPUT_FILE)
+    if not output_path.exists():
+        return df
+
+    try:
+        existing_df = pd.read_excel(output_path)
+    except Exception as exc:
+        print(f"Could not read existing {OUTPUT_FILE} for carry-forward: {exc}")
+        return df
+
+    for column in [PDF_LINK_COLUMN, "permalink"]:
+        if column not in existing_df.columns:
+            continue
+        if column not in df.columns:
+            df[column] = ""
+
+        row_count = min(len(df), len(existing_df))
+        for index in range(row_count):
+            existing_value = existing_df.at[index, column]
+            if pd.isna(existing_value):
+                continue
+
+            existing_text = str(existing_value).strip()
+            if existing_text and existing_text.lower() != "nan":
+                df.at[index, column] = existing_text
+
+    return df
+
+
+def find_uid_column(df: pd.DataFrame) -> str:
+    """
+    Automatically find the UID column.
+
+    Simple rules:
+    - First try exact matches like UID or uid
+    - Then try exact matches like source
+    - Then try any column name that contains the word uid
+    """
+    columns = list(df.columns)
+    normalized_map = {
+        column: str(column).strip().lower().replace(" ", "").replace("_", "")
+        for column in columns
+    }
+
+    for column in columns:
+        if normalized_map[column] == "uid":
+            return column
+
+    for column in columns:
+        if normalized_map[column] == "source":
+            return column
+
+    for column in columns:
+        normalized = normalized_map[column]
+        if "uid" in normalized or "source" in normalized:
+            return column
+
+    raise ValueError(
+        "Could not find a UID/source column automatically.\n"
+        f"Columns found: {columns}"
+    )
+
+
+def clean_uid(value) -> str:
+    """
+    Turn a UID cell value into a clean string.
+    Blank values become an empty string.
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return ""
+
+    return text
+
+
+def make_safe_filename(text: str) -> str:
+    """
+    Remove characters that are not safe in Windows file names.
+    """
+    safe = re.sub(r'[<>:"/\\\\|?*]', "_", text)
+    safe = safe.strip().strip(".")
+    return safe or "downloaded_file"
+
+
+def make_unique_path(folder: Path, filename: str) -> Path:
+    """
+    Return a path that does not overwrite an existing file.
+    """
+    candidate = folder / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+
+    while True:
+        candidate = folder / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def save_output_excel(df: pd.DataFrame):
+    """
+    Save the output workbook and make local PDF paths clickable in pdf_link.
+    """
+    df.to_excel(OUTPUT_FILE, index=False)
+
+    if PDF_LINK_COLUMN not in df.columns:
+        return
+
+    pdf_column_number = list(df.columns).index(PDF_LINK_COLUMN) + 1
+    workbook = load_workbook(OUTPUT_FILE)
+    sheet = workbook.active
+
+    for row_number in range(2, sheet.max_row + 1):
+        cell = sheet.cell(row=row_number, column=pdf_column_number)
+        value = str(cell.value or "").strip()
+        if not value or value.lower() == "nan":
+            continue
+
+        pdf_path = Path(value)
+        if pdf_path.exists():
+            cell.hyperlink = pdf_path.resolve().as_uri()
+            cell.style = "Hyperlink"
+
+    workbook.save(OUTPUT_FILE)
+    workbook.close()
+
+
+def wait_for_manual_login():
+    """
+    Pause so you can log in manually in your own Edge window and get to the search page.
+    """
+    print("\nUse your own Edge window for login.")
+    print("Please do these steps manually in Edge before pressing Enter:")
+    print("1. First close all normal Edge windows")
+    print("2. Start Edge with remote debugging enabled")
+    print('   open -na "Microsoft Edge" --args --remote-debugging-port=9222 --user-data-dir="$HOME/edge_debug_profile"')
+    print("3. In that Edge window, go to this page:")
+    print(f"   {START_URL}")
+    print("4. Log in if needed")
+    print("5. Deal with any cookie or consent screen")
+    print("6. Stay on the search page")
+    print("7. Make sure the search box is visible and clickable")
+    input("When Edge is ready on the search page, press Enter here to continue...")
+
+
+def try_fill_search_box(page, uid: str):
+    """
+    Try several simple search box selectors.
+    This keeps the first version flexible without being too complicated.
+    """
+    possible_search_boxes = [
+        "input[type='search']",
+        "input[name='q']",
+        "input[name='query']",
+        "input[name='search']",
+        "input[id*='search']",
+        "input[placeholder*='Search']",
+        "input[placeholder*='search']",
+        "input[type='text']",
+    ]
+
+    for selector in possible_search_boxes:
+        locator = page.locator(selector).first
+        if locator.count() > 0:
+            try:
+                locator.click()
+                locator.press("Control+A")
+                locator.press("Backspace")
+            except Exception:
+                pass
+            locator.fill(uid)
+            return True
+
+    return False
+
+
+def has_search_box(page) -> bool:
+    """
+    Check whether the current page looks like the search page.
+    """
+    possible_search_boxes = [
+        "input[type='search']",
+        "input[name='q']",
+        "input[name='query']",
+        "input[name='search']",
+        "input[id*='search']",
+        "input[placeholder*='Search']",
+        "input[placeholder*='search']",
+        "input[type='text']",
+    ]
+
+    for selector in possible_search_boxes:
+        try:
+            if page.locator(selector).first.count() > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def try_click_search_button(page):
+    """
+    Try common search button patterns.
+    If no button is found, the caller can still press Enter.
+    """
+    possible_buttons = [
+        page.get_by_role("button", name=re.compile("search", re.I)),
+        page.get_by_role("link", name=re.compile("search", re.I)),
+        page.locator("input[type='submit']").first,
+        page.locator("button[type='submit']").first,
+        page.locator("button").filter(has_text=re.compile("search", re.I)).first,
+    ]
+
+    for locator in possible_buttons:
+        try:
+            if locator.count() > 0:
+                locator.click()
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def go_to_search_page(page):
+    """
+    Make sure we are back on the main search page before starting a UID.
+    """
+    try:
+        page.goto(START_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+
+
+def try_get_permalink(page, uid: str) -> str:
+    """
+    Click the Permalink option on the results page and read the URL.
+
+    Many sites place the link into a focused text box after clicking Permalink.
+    This function checks that focused box first, then other obvious input fields.
+    """
+    permalink_buttons = [
+        ("button: Permalink", page.get_by_role("button", name=re.compile(r"permalink", re.I)).first),
+        ("link: Permalink", page.get_by_role("link", name=re.compile(r"permalink", re.I)).first),
+        ("text: Permalink", page.locator(":text('Permalink')").first),
+    ]
+
+    for label, locator in permalink_buttons:
+        try:
+            if locator.count() == 0:
+                continue
+
+            print(f"  Clicking permalink using: {label}")
+            locator.click()
+            page.wait_for_timeout(1500)
+
+            active_value = page.evaluate(
+                """
+                () => {
+                    const el = document.activeElement;
+                    if (!el) return "";
+                    if (typeof el.value === "string") return el.value.trim();
+                    return "";
+                }
+                """
+            )
+            if isinstance(active_value, str) and active_value.startswith("http"):
+                return active_value
+
+            input_selectors = [
+                "input[type='url']",
+                "input[value^='http']",
+                "textarea",
+                "input",
+            ]
+            for selector in input_selectors:
+                field = page.locator(selector).first
+                if field.count() == 0:
+                    continue
+                try:
+                    value = field.input_value().strip()
+                    if value.startswith("http"):
+                        return value
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return ""
+
+
+def try_read_visible_permalink(page) -> str:
+    """
+    Read a permalink directly from the current page without clicking anything.
+
+    This is useful on a record page where a Permalink section is already visible.
+    """
+    try:
+        permalink_section_selectors = [
+            "label:has-text('Permalink') + input",
+            "label:has-text('Permalink') ~ input",
+            "text=Permalink:",
+        ]
+
+        for selector in permalink_section_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                value = locator.input_value().strip()
+                if value.startswith("http"):
+                    return value
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    input_selectors = [
+        "input[type='url']",
+        "input[value^='http']",
+        "textarea",
+        "input",
+    ]
+
+    for selector in input_selectors:
+        try:
+            field = page.locator(selector).first
+            if field.count() == 0:
+                continue
+            value = field.input_value().strip()
+            if value.startswith("http"):
+                return value
+        except Exception:
+            pass
+
+    try:
+        page_text = page.locator("body").inner_text(timeout=5000)
+        url_match = re.search(r"https?://\S+", page_text)
+        if url_match:
+            return url_match.group(0).rstrip(".,);")
+    except Exception:
+        pass
+
+    return ""
+
+
+def find_pdf_full_text_locator(page):
+    """
+    Find the ProQuest PDF - Full Text control on a record page.
+    """
+    pdf_full_text_pattern = re.compile(r"pdf\s*-\s*full\s*text", re.I)
+    possible_controls = [
+        page.get_by_role("link", name=pdf_full_text_pattern).first,
+        page.get_by_role("button", name=pdf_full_text_pattern).first,
+        page.get_by_text(pdf_full_text_pattern).first,
+        page.locator("a").filter(has_text=pdf_full_text_pattern).first,
+        page.locator("button").filter(has_text=pdf_full_text_pattern).first,
+    ]
+
+    for locator in possible_controls:
+        try:
+            if locator.count() > 0 and locator.is_visible(timeout=2000):
+                return locator
+        except Exception:
+            pass
+
+    return None
+
+
+def save_download(download, uid: str) -> str:
+    """
+    Save a Playwright download to the local PDF folder.
+    """
+    download_folder = Path(PDF_DOWNLOAD_FOLDER)
+    download_folder.mkdir(exist_ok=True)
+
+    suggested_name = download.suggested_filename or f"{make_safe_filename(uid)}.pdf"
+    if not suggested_name.lower().endswith(".pdf"):
+        suggested_name = f"{make_safe_filename(uid)}.pdf"
+
+    safe_name = make_safe_filename(suggested_name)
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name = f"{safe_name}.pdf"
+
+    save_path = make_unique_path(download_folder, safe_name)
+    download.save_as(save_path)
+    return str(save_path)
+
+
+def save_pdf_bytes(pdf_bytes: bytes, uid: str) -> str:
+    """
+    Save PDF bytes to the local PDF folder.
+    """
+    download_folder = Path(PDF_DOWNLOAD_FOLDER)
+    download_folder.mkdir(exist_ok=True)
+
+    safe_uid = make_safe_filename(uid)
+    save_path = make_unique_path(download_folder, f"{safe_uid}_complete.pdf")
+    save_path.write_bytes(pdf_bytes)
+    return str(save_path)
+
+
+def find_complete_replica_pdf_url(page) -> str:
+    """
+    Find the direct "Replica of Original - Complete" PDF URL.
+    """
+    complete_pattern = re.compile(r"replica\s+of\s+original\s*-\s*complete", re.I)
+
+    try:
+        links = page.locator("a").evaluate_all(
+            """
+            els => els.map(a => ({
+                text: (a.innerText || a.textContent || "").trim(),
+                href: a.href || ""
+            }))
+            """
+        )
+    except Exception:
+        return ""
+
+    complete_links = [
+        item["href"]
+        for item in links
+        if complete_pattern.search(item.get("text", ""))
+        and item.get("href", "")
+    ]
+
+    for href in complete_links:
+        if ".pdf" in href.lower() and "pdfviewer" not in href.lower():
+            return href
+
+    for href in complete_links:
+        if href:
+            return href
+
+    return ""
+
+
+def find_complete_replica_pdf_locator(page):
+    """
+    Find the clickable "Replica of Original - Complete" PDF link.
+    """
+    complete_pattern = re.compile(r"replica\s+of\s+original\s*-\s*complete", re.I)
+    direct_links = page.locator("a").filter(has_text=complete_pattern)
+
+    try:
+        for index in range(direct_links.count()):
+            locator = direct_links.nth(index)
+            href = locator.get_attribute("href") or ""
+            if ".pdf" in href.lower() and "pdfviewer" not in href.lower():
+                return locator
+    except Exception:
+        pass
+
+    try:
+        if direct_links.count() > 0:
+            return direct_links.first
+    except Exception:
+        pass
+
+    return None
+
+
+def click_complete_replica_pdf(page, uid: str) -> str:
+    """
+    Click the complete-replica link and save it if the browser treats it as a download.
+    """
+    locator = find_complete_replica_pdf_locator(page)
+    if locator is None:
+        return ""
+
+    try:
+        print("  Clicking Replica of Original - Complete...")
+        with page.expect_download(timeout=DOWNLOAD_EVENT_TIMEOUT_MS) as download_info:
+            locator.click()
+        saved_path = save_download(download_info.value, uid)
+        print(f"  Downloaded complete replica PDF: {saved_path}")
+        return saved_path
+    except PlaywrightTimeoutError:
+        print("  Complete replica click did not trigger a browser download.")
+    except Exception as exc:
+        print(f"  Could not download by clicking complete replica: {exc}")
+
+    return ""
+
+
+def download_pdf_url_with_session(page, pdf_url: str, uid: str) -> str:
+    """
+    Download a PDF URL using the current logged-in browser context.
+    """
+    if not pdf_url:
+        return ""
+
+    print("  Fetching complete replica PDF directly...")
+    response = page.context.request.get(pdf_url, timeout=PDF_DOWNLOAD_TIMEOUT_MS)
+    if not response.ok:
+        print(f"  Complete replica PDF request failed with status {response.status}.")
+        return ""
+
+    pdf_bytes = response.body()
+    if not pdf_bytes.startswith(b"%PDF"):
+        print("  Complete replica link did not return PDF bytes.")
+        return ""
+
+    saved_path = save_pdf_bytes(pdf_bytes, uid)
+    print(f"  Downloaded complete replica PDF: {saved_path}")
+    return saved_path
+
+
+def download_pdf_full_text_from_permalink(page, permalink: str, uid: str) -> str:
+    """
+    Open the saved permalink, find "PDF - Full Text", and download the PDF.
+
+    ProQuest usually exposes the actual PDF link after the PDF - Full Text
+    section is visible. Prefer that section, then download the complete replica
+    PDF link using the logged-in browser session.
+    """
+    if not permalink:
+        return ""
+
+    print("  Opening permalink to look for PDF - Full Text...")
+    page.goto(permalink, wait_until="domcontentloaded")
+    page.wait_for_timeout(4000)
+
+    pdf_locator = find_pdf_full_text_locator(page)
+    if pdf_locator is None:
+        print("  Could not find PDF - Full Text on the permalink page.")
+        return ""
+
+    href = ""
+    try:
+        href = pdf_locator.get_attribute("href") or ""
+    except Exception:
+        pass
+
+    try:
+        print("  Clicking PDF - Full Text...")
+        with page.expect_download(timeout=DOWNLOAD_EVENT_TIMEOUT_MS) as download_info:
+            pdf_locator.click()
+        saved_path = save_download(download_info.value, uid)
+        print(f"  Downloaded PDF: {saved_path}")
+        return saved_path
+    except PlaywrightTimeoutError:
+        print("  PDF - Full Text did not trigger an immediate download. Looking for the PDF link...")
+    except Exception as exc:
+        print(f"  Could not download directly from PDF - Full Text: {exc}")
+
+    page.wait_for_timeout(2000)
+
+    complete_pdf_url = find_complete_replica_pdf_url(page)
+    if complete_pdf_url:
+        saved_path = download_pdf_url_with_session(page, complete_pdf_url, uid)
+        if saved_path:
+            return saved_path
+
+    saved_path = click_complete_replica_pdf(page, uid)
+    if saved_path:
+        return saved_path
+
+    if href:
+        pdf_url = urljoin(page.url, href)
+        try:
+            with page.expect_download(timeout=DOWNLOAD_EVENT_TIMEOUT_MS) as download_info:
+                page.goto(pdf_url, wait_until="domcontentloaded")
+            saved_path = save_download(download_info.value, uid)
+            print(f"  Downloaded PDF: {saved_path}")
+            return saved_path
+        except PlaywrightTimeoutError:
+            print("  Linked PDF page did not trigger a download.")
+        except Exception as exc:
+            print(f"  Could not download from linked PDF page: {exc}")
+
+    complete_pdf_url = find_complete_replica_pdf_url(page)
+    if complete_pdf_url:
+        saved_path = download_pdf_url_with_session(page, complete_pdf_url, uid)
+        if saved_path:
+            return saved_path
+
+    return ""
+
+
+def try_filter_to_hearing(page) -> bool:
+    """
+    Try to filter the results page to Document Type: HEARING.
+    """
+    hearing_filters = [
+        ("checkbox: HEARING", page.get_by_role("checkbox", name=re.compile(r"hearing", re.I)).first),
+        ("label: HEARING", page.get_by_text(re.compile(r"^hearing$", re.I)).first),
+        ("document type HEARING", page.locator(":has-text('Document Type')").locator(":text('HEARING')").first),
+        ("facet HEARING", page.locator("[class*='facet']:has-text('HEARING')").first),
+    ]
+
+    for label, locator in hearing_filters:
+        try:
+            if locator.count() == 0:
+                continue
+
+            print(f"  Applying HEARING filter using: {label}")
+            locator.click()
+            page.wait_for_timeout(4000)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def process_one_uid(page, uid: str) -> str:
+    """
+    Search one UID, click Permalink on the results page,
+    and capture that link.
+    If the results page has no Permalink option, filter to Document Type: HEARING
+    and try Permalink again.
+    If anything fails, return an empty string.
+    """
+    print(f"Searching UID: {uid}")
+
+    if not try_fill_search_box(page, uid):
+        print(f"  Could not find a search box for UID {uid}")
+        return ""
+
+    search_clicked = try_click_search_button(page)
+    if not search_clicked:
+        # If no visible search button is found, pressing Enter is the simplest fallback.
+        page.keyboard.press("Enter")
+
+    # Give the results page a moment to load before looking for the Permalink button.
+    page.wait_for_timeout(4000)
+
+    permalink = try_get_permalink(page, uid)
+    if permalink:
+        print(f"  Saved permalink: {permalink}")
+        return permalink
+
+    print("  No permalink on results page. Trying Document Type: HEARING filter...")
+    if try_filter_to_hearing(page):
+        permalink = try_get_permalink(page, uid)
+        if permalink:
+            print(f"  Saved permalink after HEARING filter: {permalink}")
+            return permalink
+
+    print(f"  Could not find a permalink for UID {uid}")
+    return ""
+
+
+def process_one_uid_with_retry(page, uid: str) -> str:
+    """
+    Try each UID up to two times.
+
+    Each attempt starts from the search page again so old results do not
+    interfere with the next search.
+    """
+    for attempt in range(1, 3):
+        print(f"  Attempt {attempt} for UID {uid}")
+        go_to_search_page(page)
+
+        permalink = process_one_uid(page, uid)
+        if permalink:
+            return permalink
+
+        print(f"  Attempt {attempt} did not succeed for UID {uid}")
+
+    return ""
+
+
+def main():
+    """
+    Main script flow.
+    """
+    print("Starting permalink collection script...")
+    args = parse_args()
+
+    if args.start_excel_row < 2:
+        raise ValueError("--start-excel-row must be 2 or greater because row 1 is the header.")
+
+    if args.batch_size is not None and args.batch_size < 1:
+        raise ValueError("--batch-size must be 1 or greater.")
+
+    if args.save_every < 1:
+        raise ValueError("--save-every must be 1 or greater.")
+
+    if args.batch_size is not None:
+        batch_end_excel_row = args.start_excel_row + args.batch_size - 1
+        if args.end_excel_row is None:
+            args.end_excel_row = batch_end_excel_row
+        else:
+            args.end_excel_row = min(args.end_excel_row, batch_end_excel_row)
+
+    if args.end_excel_row is not None and args.end_excel_row < args.start_excel_row:
+        raise ValueError("--end-excel-row must be greater than or equal to --start-excel-row.")
+
+    excel_path = find_excel_file()
+    df = load_excel(excel_path)
+    df = carry_forward_existing_output(df)
+
+    uid_column = find_uid_column(df)
+    print(f"UID column found automatically: {uid_column}")
+
+    # Create the output columns if they do not already exist.
+    if PDF_LINK_COLUMN not in df.columns:
+        df[PDF_LINK_COLUMN] = ""
+    if "permalink" not in df.columns:
+        df["permalink"] = ""
+
+    with sync_playwright() as p:
+        wait_for_manual_login()
+
+        print(f"Connecting to Edge at {EDGE_DEBUG_URL} ...")
+        try:
+            browser = p.chromium.connect_over_cdp(EDGE_DEBUG_URL)
+        except Exception as exc:
+            raise RuntimeError(
+                "\nCould not connect to Edge on port 9222.\n"
+                "Please do this exactly:\n"
+                "1. Close all normal Edge windows\n"
+                '2. Run this command:\n'
+                '   open -na "Microsoft Edge" --args --remote-debugging-port=9222 --user-data-dir="$HOME/edge_debug_profile"\n'
+                f"3. Open this page in Edge: {START_URL}\n"
+                "4. Log in and wait until the search box is visible\n"
+                "5. Run python3 extracting_pdf_links.py again\n"
+            ) from exc
+
+        # Reuse the first existing Edge context and tab if possible.
+        if browser.contexts:
+            context = browser.contexts[0]
+        else:
+            context = browser.new_context(accept_downloads=True)
+
+        if context.pages:
+            page = context.pages[0]
+        else:
+            page = context.new_page()
+            page.goto(START_URL, wait_until="domcontentloaded")
+
+        page.wait_for_timeout(2000)
+
+        total_rows = len(df)
+        processed_since_save = 0
+        processed_in_run = 0
+
+        if args.end_excel_row is None:
+            print(f"Processing Excel rows {args.start_excel_row} through {total_rows + 1}.")
+        else:
+            print(f"Processing Excel rows {args.start_excel_row} through {args.end_excel_row}.")
+
+        for index, row in df.iterrows():
+            excel_row_number = index + 2
+
+            if excel_row_number < args.start_excel_row:
+                continue
+
+            if args.end_excel_row is not None and excel_row_number > args.end_excel_row:
+                continue
+
+            uid = clean_uid(row[uid_column])
+
+            print(f"\nExcel row {excel_row_number} of {total_rows + 1}")
+
+            # If UID is blank, skip it.
+            if not uid:
+                print("  UID is blank. Skipping.")
+                df.at[index, "permalink"] = ""
+                continue
+
+            # If permalink and PDF link already exist, keep them and skip.
+            existing_permalink = str(row.get("permalink", "")).strip()
+            existing_pdf_link = str(row.get(PDF_LINK_COLUMN, "")).strip()
+            if (
+                existing_permalink
+                and existing_permalink.lower() != "nan"
+                and existing_pdf_link
+                and existing_pdf_link.lower() != "nan"
+            ):
+                print(f"  permalink and {PDF_LINK_COLUMN} already exist. Skipping.")
+                continue
+
+            try:
+                permalink = existing_permalink
+                if not permalink or permalink.lower() == "nan":
+                    permalink = process_one_uid_with_retry(page, uid)
+
+                df.at[index, "permalink"] = permalink
+
+                if permalink:
+                    pdf_link = download_pdf_full_text_from_permalink(page, permalink, uid)
+                    df.at[index, PDF_LINK_COLUMN] = pdf_link
+                else:
+                    df.at[index, PDF_LINK_COLUMN] = ""
+            except PlaywrightTimeoutError:
+                print(f"  Timed out while processing UID {uid}. Leaving output blank.")
+                if not existing_permalink or existing_permalink.lower() == "nan":
+                    df.at[index, "permalink"] = ""
+                df.at[index, PDF_LINK_COLUMN] = ""
+            except Exception as exc:
+                print(f"  Error while processing UID {uid}: {exc}")
+                print("  Leaving PDF blank and continuing.")
+                if not existing_permalink or existing_permalink.lower() == "nan":
+                    df.at[index, "permalink"] = ""
+                df.at[index, PDF_LINK_COLUMN] = ""
+
+            processed_since_save += 1
+            processed_in_run += 1
+
+            if processed_since_save >= args.save_every:
+                print(f"  Saving progress after {processed_in_run} processed row(s)...")
+                save_output_excel(df)
+                processed_since_save = 0
+
+            # Go back to the search page for the next UID.
+            try:
+                go_to_search_page(page)
+            except Exception:
+                print("  Could not go back automatically.")
+                print("  If the next search fails, manually return to the search page and run again.")
+
+            time.sleep(1)
+
+        browser.close()
+
+    # Save one final time at the end.
+    if processed_since_save:
+        print("Saving final batch progress...")
+    save_output_excel(df)
+    print(f"\nDone. Updated spreadsheet saved as: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
